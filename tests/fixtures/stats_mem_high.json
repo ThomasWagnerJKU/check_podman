@@ -1,0 +1,26 @@
+[
+ {
+  "id": "9bbc21894ff4",
+  "name": "web",
+  "cpu_time": "1m19.792862s",
+  "cpu_percent": "3.12%",
+  "avg_cpu": "3.12%",
+  "mem_usage": "1.85GB / 2GB",
+  "mem_percent": "92.50%",
+  "net_io": "4.738MB / 19.63MB",
+  "block_io": "8.589MB / 147.7MB",
+  "pids": "81"
+ },
+ {
+  "id": "1103c1434590",
+  "name": "db",
+  "cpu_time": "12.695654s",
+  "cpu_percent": "0.41%",
+  "avg_cpu": "0.41%",
+  "mem_usage": "214.3MB / 1GB",
+  "mem_percent": "20.93%",
+  "net_io": "9.698MB / 24.1MB",
+  "block_io": "19.97MB / 60.9MB",
+  "pids": "12"
+ }
+]

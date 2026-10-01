@@ -1,0 +1,344 @@
+#!/usr/bin/python3
+# Nagios/Icinga plugin to check a rootless podman user's containers via sudo.
+#
+# Copyright (C) 2026 Thomas Wagner <thomas.wagner@jku.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+STATE_TEXT = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+
+VERSION = "0.1"
+DEFAULT_PODMAN = "/usr/bin/podman"
+DEFAULT_TIMEOUT = 15
+DEFAULT_WARNING = "80"
+DEFAULT_CRITICAL = "90"
+
+SIZE_RE = re.compile(r'^([\d.]+)\s*([A-Za-z]*)$')
+SIZE_UNITS = {
+    "": 1, "b": 1,
+    "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+    "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
+}
+
+
+class PluginError(Exception):
+    def __init__(self, state, message):
+        super().__init__(message)
+        self.state = state
+        self.message = message
+
+
+class Range:
+    """Threshold range as defined by the monitoring plugins guidelines."""
+
+    def __init__(self, start, end, inside):
+        self.start = start
+        self.end = end
+        self.inside = inside
+        self.spec = self._normalized()
+
+    def _normalized(self):
+        """Threshold as perfdata carries it: graphers want a plain number, so one-sided ranges become their bound."""
+        if not self.inside and self.start == float("-inf") and self.end == float("inf"):
+            return ""
+        if not self.inside and self.end == float("inf"):
+            return format_number(self.start)
+        if not self.inside and self.start in (0, float("-inf")) and self.end != float("inf"):
+            return format_number(self.end)
+        low = "~" if self.start == float("-inf") else format_number(self.start)
+        high = "" if self.end == float("inf") else format_number(self.end)
+        return ("@" if self.inside else "") + "%s:%s" % (low, high)
+
+    @classmethod
+    def parse(cls, spec):
+        raw = spec
+        inside = spec.startswith("@")
+        if inside:
+            spec = spec[1:]
+
+        if ":" in spec:
+            low, high = spec.split(":", 1)
+        else:
+            low, high = "0", spec
+
+        try:
+            start = float("-inf") if low in ("~", "") else float(low)
+            end = float("inf") if high == "" else float(high)
+        except ValueError:
+            raise PluginError(UNKNOWN, "invalid threshold %r" % raw)
+
+        if start > end:
+            raise PluginError(UNKNOWN, "invalid threshold %r: start is above end" % raw)
+
+        return cls(start, end, inside)
+
+    def breached(self, value):
+        within = self.start <= value <= self.end
+        return within if self.inside else not within
+
+
+def format_number(value):
+    value = float(value)
+    if value.is_integer():
+        return "%d" % value
+    return ("%.3f" % value).rstrip("0").rstrip(".")
+
+
+def perfdata(label, value, uom="", warn=None, crit=None, minimum=None, maximum=None):
+    fields = [
+        warn.spec if warn else "",
+        crit.spec if crit else "",
+        "" if minimum is None else format_number(minimum),
+        "" if maximum is None else format_number(maximum),
+    ]
+    while fields and fields[-1] == "":
+        fields.pop()
+    out = "%s=%s%s" % (label, format_number(value), uom)
+    if fields:
+        out += ";" + ";".join(fields)
+    return out
+
+
+def perfdata_label(label):
+    # quotes are doubled inside a quoted label, '=' separates label and value
+    return "'" + label.replace("'", "''").replace("=", "_") + "'"
+
+
+def lookup(data, *names):
+    """First matching key among several known spellings: podman's JSON field names have
+    changed across versions, so look for either rather than betting on one."""
+    for name in names:
+        if name in data:
+            return data[name]
+        for key in data:
+            if key.lower() == name.lower():
+                return data[key]
+    return None
+
+
+def parse_size(text):
+    """'231.7MB' -> bytes. None if it doesn't look like a size at all."""
+    if text is None:
+        return None
+    match = SIZE_RE.match(text.strip())
+    if not match:
+        return None
+    value, unit = match.groups()
+    multiplier = SIZE_UNITS.get(unit.lower())
+    return None if multiplier is None else float(value) * multiplier
+
+
+def parse_percent(text):
+    if text is None:
+        return None
+    try:
+        return float(str(text).strip().rstrip("%"))
+    except ValueError:
+        return None
+
+
+def parse_pair(text, sep=" / "):
+    """'4.738MB / 19.63MB' -> ('4.738MB', '19.63MB'); (None, None) if there's no separator."""
+    if text is None or sep not in text:
+        return None, None
+    left, right = text.split(sep, 1)
+    return left.strip(), right.strip()
+
+
+def run_podman(args, podman_args):
+    command = ["sudo", "-u", args.user, args.podman] + podman_args
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                universal_newlines=True, timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        raise PluginError(CRITICAL, "no answer from podman within %ss" % format_number(args.timeout))
+    except OSError as err:
+        raise PluginError(UNKNOWN, "cannot run %s: %s" % (command[0], err.strerror))
+
+    if result.returncode != 0:
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        reason = lines[-1] if lines else "exit code %d" % result.returncode
+        state = UNKNOWN if "sudo" in reason.lower() or "password" in reason.lower() else CRITICAL
+        raise PluginError(state, "podman %s failed: %s" % (podman_args[0], reason))
+
+    try:
+        return json.loads(result.stdout) if result.stdout.strip() else []
+    except ValueError:
+        raise PluginError(UNKNOWN, "cannot parse podman %s output as JSON" % podman_args[0])
+
+
+def query(args):
+    containers = run_podman(args, ["ps", "-a", "--format", "json"])
+    running_names = [lookup(c, "Names", "names")[0] for c in containers
+                      if str(lookup(c, "State", "state")).lower() == "running"]
+    stats = run_podman(args, ["stats", "--no-stream", "--format", "json"] + running_names) \
+        if running_names else []
+    return containers, stats
+
+
+def container_perfdata(name, entry, warning=None, critical=None):
+    """Perfdata for one running container, and its memory usage in percent (for thresholds)."""
+    def label(suffix):
+        return perfdata_label(name + suffix)
+
+    perf = []
+
+    cpu_percent = parse_percent(lookup(entry, "cpu_percent", "CPU", "cpu"))
+    if cpu_percent is not None:
+        perf.append(perfdata(label("_cpu"), cpu_percent, "%"))
+
+    used_text, limit_text = parse_pair(lookup(entry, "mem_usage", "MemUsage"))
+    used, limit = parse_size(used_text), parse_size(limit_text)
+    if used is not None:
+        perf.append(perfdata(label("_mem"), used, "B", minimum=0, maximum=limit))
+
+    mem_percent = parse_percent(lookup(entry, "mem_percent", "MemPercent"))
+    if mem_percent is None and used is not None and limit:
+        mem_percent = used / limit * 100
+    if mem_percent is not None:
+        perf.append(perfdata(label("_mem_percent"), mem_percent, "%", warning, critical))
+
+    net_in_text, net_out_text = parse_pair(lookup(entry, "net_io", "NetIO"))
+    net_in, net_out = parse_size(net_in_text), parse_size(net_out_text)
+    if net_in is not None:
+        perf.append(perfdata(label("_net_in"), net_in, "B"))
+    if net_out is not None:
+        perf.append(perfdata(label("_net_out"), net_out, "B"))
+
+    block_in_text, block_out_text = parse_pair(lookup(entry, "block_io", "BlockIO"))
+    block_in, block_out = parse_size(block_in_text), parse_size(block_out_text)
+    if block_in is not None:
+        perf.append(perfdata(label("_block_in"), block_in, "B"))
+    if block_out is not None:
+        perf.append(perfdata(label("_block_out"), block_out, "B"))
+
+    pids = lookup(entry, "pids", "PIDs")
+    if pids is not None:
+        try:
+            perf.append(perfdata(label("_pids"), int(pids)))
+        except (TypeError, ValueError):
+            pass
+
+    return perf, mem_percent
+
+
+def check(args, containers, stats):
+    if args.name:
+        by_name = {lookup(c, "Names", "names")[0]: c for c in containers}
+        missing = [name for name in args.name if name not in by_name]
+        if missing:
+            raise PluginError(CRITICAL, "container(s) not found: %s" % ", ".join(sorted(missing)))
+        containers = [by_name[name] for name in args.name]
+
+    if not containers:
+        raise PluginError(UNKNOWN, "%s has no containers" % args.user)
+
+    by_stats_name = {lookup(s, "name", "Name"): s for s in stats}
+
+    state = OK
+    problems = []
+    up = []
+    perf = []
+
+    for container in sorted(containers, key=lambda c: lookup(c, "Names", "names")[0]):
+        name = lookup(container, "Names", "names")[0]
+        container_state = str(lookup(container, "State", "state"))
+        if container_state.lower() != "running":
+            status = lookup(container, "Status", "status") or container_state
+            problems.append("%s is down (%s)" % (name, status))
+            state = CRITICAL
+            continue
+
+        up.append(name)
+        entry = by_stats_name.get(name)
+        if entry is None:
+            continue
+
+        container_perf, mem_percent = container_perfdata(name, entry, args.warning, args.critical)
+        perf += container_perf
+
+        if mem_percent is not None:
+            if args.critical and args.critical.breached(mem_percent):
+                state = CRITICAL
+                problems.append("%s memory at %s%%" % (name, format_number(mem_percent)))
+            elif args.warning and args.warning.breached(mem_percent):
+                state = max(state, WARNING)
+                problems.append("%s memory at %s%%" % (name, format_number(mem_percent)))
+
+    summary = ("%d of %d container(s) running: %s" % (len(up), len(containers), ", ".join(up))
+               if up else "0 of %d container(s) running" % len(containers))
+    message = ("; ".join(problems) + ", " if problems else "") + summary
+    return state, message, perf
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error, which Nagios reads as CRITICAL; exit UNKNOWN instead."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+        sys.exit(UNKNOWN)
+
+
+def build_parser():
+    parser = ArgumentParser(
+        prog="check_podman",
+        description="Nagios/Icinga plugin to check a rootless podman user's containers: every "
+                    "container has to be running, CPU/memory/network/block I/O usage of each is "
+                    "reported as performance data, and the thresholds apply to how close each "
+                    "running container is to its memory limit.",
+        epilog="Runs 'sudo -u USER podman ...', which needs a NOPASSWD sudoers rule for podman "
+               "ps/stats and lingering enabled for USER (loginctl enable-linger USER). Thresholds "
+               "take the monitoring plugins range format and apply to percent of the memory limit "
+               "in use, e.g. the defaults -w 80 -c 90 warn at 80% and alert at 90%.")
+    parser.add_argument("-V", "--version", action="version", version="check_podman %s" % VERSION)
+    parser.add_argument("-u", "--user", required=True, help="the rootless user owning the containers")
+    parser.add_argument("-p", "--podman", default=DEFAULT_PODMAN,
+                        help="path of the podman binary (default: %s)" % DEFAULT_PODMAN)
+    parser.add_argument("-n", "--name", action="append", default=[],
+                        help="only check this container; repeatable (default: every container the "
+                             "user has)")
+    parser.add_argument("-w", "--warning", default=DEFAULT_WARNING,
+                        help="warning range for memory usage, in percent of the container's memory "
+                             "limit (default: %s)" % DEFAULT_WARNING)
+    parser.add_argument("-c", "--critical", default=DEFAULT_CRITICAL,
+                        help="critical range for memory usage, in percent of the container's memory "
+                             "limit (default: %s)" % DEFAULT_CRITICAL)
+    parser.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help="timeout in seconds for each podman call (default: %d)" % DEFAULT_TIMEOUT)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.warning = Range.parse(args.warning) if args.warning else None
+        args.critical = Range.parse(args.critical) if args.critical else None
+        containers, stats = query(args)
+        state, message, perf = check(args, containers, stats)
+    except PluginError as err:
+        print("PODMAN %s - %s" % (STATE_TEXT[err.state], err.message))
+        return err.state
+
+    output = "PODMAN %s - %s" % (STATE_TEXT[state], message)
+    if perf:
+        output += " | " + " ".join(perf)
+    print(output)
+    return state
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(UNKNOWN)

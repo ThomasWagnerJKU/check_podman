@@ -1,0 +1,18 @@
+[
+  {
+    "Id": "9bbc21894ff46e3bec18955205779e93bcf4d904a017909952a2e5f7857e294",
+    "Names": ["web"],
+    "Image": "docker.io/example/app:latest",
+    "State": "running",
+    "Status": "Up 42 minutes",
+    "Created": 1790840966
+  },
+  {
+    "Id": "1103c14345906c9e7919f536b7a24d640d83d8720261229a0d8e4fe8d0bae62",
+    "Names": ["db"],
+    "Image": "docker.io/example/app:latest",
+    "State": "running",
+    "Status": "Up 51 minutes",
+    "Created": 1790841242
+  }
+]
