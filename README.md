@@ -101,6 +101,16 @@ stats for a container that isn't running).
 
 The plugin prints exactly one line.
 
+## Bash completion
+
+`completions/check_podman` completes the options and their values, also when
+the plugin is called by its full path. The packages install it; otherwise
+copy it to bash-completion's directory:
+
+```sh
+install -D -m 0644 completions/check_podman /usr/share/bash-completion/completions/check_podman
+```
+
 ## Tests
 
 ```sh

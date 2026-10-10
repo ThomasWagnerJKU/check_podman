@@ -1,0 +1,34 @@
+# bash completion for check_podman                           -*- shell-script -*-
+
+_check_podman()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    # --option=value: bash splits at the =
+    if [[ $cur == = ]]; then
+        cur=
+    elif [[ $prev == = && $COMP_CWORD -ge 2 ]]; then
+        prev=${COMP_WORDS[COMP_CWORD-2]}
+    fi
+    COMPREPLY=()
+
+    case $prev in
+        -u | --user)
+            mapfile -t COMPREPLY < <(compgen -u -- "$cur")
+            return
+            ;;
+        -p | --podman)
+            compopt -o filenames 2>/dev/null
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
+        # container names would need sudo: none for -n
+        -n | --name | -w | --warning | -c | --critical | -t | --timeout)
+            return
+            ;;
+    esac
+
+    # no positional arguments: offer the options
+    mapfile -t COMPREPLY < <(compgen -W '-h --help -V --version -u --user -p --podman
+        -n --name -w --warning -c --critical -t --timeout' -- "$cur")
+}
+complete -F _check_podman check_podman
